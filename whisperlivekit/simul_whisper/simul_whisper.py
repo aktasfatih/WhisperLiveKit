@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from whisperlivekit.backend_support import faster_backend_available, mlx_backend_available
-from whisperlivekit.whisper.audio import N_FRAMES, N_SAMPLES, TOKENS_PER_SECOND, log_mel_spectrogram, pad_or_trim
+from whisperlivekit.whisper.audio import HOP_LENGTH, N_FRAMES, N_SAMPLES, TOKENS_PER_SECOND, log_mel_spectrogram, pad_or_trim
 from whisperlivekit.whisper.decoding import BeamSearchDecoder, GreedyDecoder, SuppressTokens
 from whisperlivekit.whisper.timing import median_filter
 
@@ -334,10 +334,35 @@ class AlignAtt(AlignAttBase):
                             )
                 encoder_feature = torch.as_tensor(arr, device=self.device)
         else:
-            mel_padded = log_mel_spectrogram(
-                input_segments, n_mels=self.model.dims.n_mels,
-                padding=N_SAMPLES, device=self.device,
-            ).unsqueeze(0)
+            current_len = len(input_segments)
+            if (
+                self.state.mel_cache_spec is not None
+                and current_len >= self.state.mel_cache_waveform_len
+            ):
+                # Incremental mel: only compute STFT for new audio, append to cache
+                cached_mel = self.state.mel_cache_spec
+                new_audio = input_segments[self.state.mel_cache_waveform_len:]
+                if len(new_audio) > 0:
+                    new_mel = log_mel_spectrogram(
+                        new_audio, n_mels=self.model.dims.n_mels,
+                        padding=0, device=self.device,
+                    )
+                    full_mel = torch.cat([cached_mel, new_mel], dim=-1)
+                else:
+                    full_mel = cached_mel
+            else:
+                # Full recompute (first call or segments were removed)
+                full_mel = log_mel_spectrogram(
+                    input_segments, n_mels=self.model.dims.n_mels,
+                    padding=0, device=self.device,
+                )
+
+            # Cache the unpadded mel
+            self.state.mel_cache_spec = full_mel
+            self.state.mel_cache_waveform_len = current_len
+
+            # Pad for encoder (N_SAMPLES padding, then trim to N_FRAMES)
+            mel_padded = F.pad(full_mel, (0, N_SAMPLES // HOP_LENGTH)).unsqueeze(0)
             mel = pad_or_trim(mel_padded, N_FRAMES)
             content_mel_len = int((mel_padded.shape[2] - mel.shape[2]) / 2)
             encoder_feature = self.model.encoder(mel)
@@ -451,6 +476,6 @@ class AlignAtt(AlignAttBase):
     def _evaluate(self, tensor):
         pass  # No-op for PyTorch
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def infer(self, is_last=False):
         return super().infer(is_last)

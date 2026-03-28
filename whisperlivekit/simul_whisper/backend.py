@@ -211,13 +211,14 @@ class SimulStreamingASR:
                 audio_max_len=self.audio_max_len,
                 audio_min_len=self.audio_min_len,
                 cif_ckpt_path=self.cif_ckpt_path,
-                decoder_type="beam",
+                decoder_type="greedy" if self.beams <= 1 else "beam",
                 beam_size=self.beams,
                 task="translate" if self.direct_english_translation else "transcribe",
                 never_fire=self.never_fire,
                 init_prompt=self.init_prompt,
                 max_context_tokens=self.max_context_tokens,
                 static_init_prompt=self.static_init_prompt,
+                encoder_cache_threshold_s=getattr(self, 'encoder_cache_threshold_s', 2.0),
         )
 
         # Set up tokenizer for translation if needed

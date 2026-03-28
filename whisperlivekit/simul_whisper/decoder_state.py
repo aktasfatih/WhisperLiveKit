@@ -53,12 +53,18 @@ class DecoderState:
     encoder_cache_mel_len: int = 0  # content_mel_len when cache was set
     encoder_cache_num_segments: int = 0  # Number of segments when cache was set
 
+    # Mel spectrogram cache — avoids recomputing STFT on unchanged audio
+    mel_cache_waveform_len: int = 0  # Number of audio samples when mel was cached
+    mel_cache_spec: Optional[torch.Tensor] = None  # Cached mel spectrogram (n_mels, n_frames)
+
     def invalidate_encoder_cache(self):
         """Invalidate encoder cache (e.g., when segments are removed)."""
         self.encoder_cache_output = None
         self.encoder_cache_audio_len = 0.0
         self.encoder_cache_mel_len = 0
         self.encoder_cache_num_segments = 0
+        self.mel_cache_waveform_len = 0
+        self.mel_cache_spec = None
 
     def clean_cache(self):
         """Clean the kv_cache after each inference step."""
