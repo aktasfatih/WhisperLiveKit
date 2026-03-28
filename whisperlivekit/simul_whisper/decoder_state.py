@@ -47,25 +47,26 @@ class DecoderState:
 
     inference: Any = None
 
+    # Encoder output cache — avoids re-encoding unchanged audio
+    encoder_cache_audio_len: float = 0.0  # Length of audio (in samples) when cache was set
+    encoder_cache_output: Optional[torch.Tensor] = None
+    encoder_cache_mel_len: int = 0  # content_mel_len when cache was set
+    encoder_cache_num_segments: int = 0  # Number of segments when cache was set
+
+    def invalidate_encoder_cache(self):
+        """Invalidate encoder cache (e.g., when segments are removed)."""
+        self.encoder_cache_output = None
+        self.encoder_cache_audio_len = 0.0
+        self.encoder_cache_mel_len = 0
+        self.encoder_cache_num_segments = 0
+
     def clean_cache(self):
         """Clean the kv_cache after each inference step."""
-        # Explicitly delete tensor references to free GPU memory
-        if self.kv_cache:
-            for key in list(self.kv_cache.keys()):
-                tensor = self.kv_cache.pop(key, None)
-                if tensor is not None:
-                    del tensor
-
-        # Clear the dict
+        # Clear the dict — avoid torch.cuda.empty_cache() on every step as it
+        # forces a device sync and destroys performance.
         self.kv_cache.clear()
 
-        # Force GPU cache cleanup (only if CUDA is available)
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         if self.decoder_type == "beam" and self.inference is not None:
-            # Create NEW dict instead of sharing reference
             self.inference.kv_cache = {}
             if self.token_decoder is not None:
                 self.token_decoder.reset()
@@ -95,4 +96,5 @@ class DecoderState:
         self.tokens = []
         self.kv_cache = {}
         self.first_timestamp = None
+        self.invalidate_encoder_cache()
 

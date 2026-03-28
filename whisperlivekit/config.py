@@ -50,6 +50,9 @@ class WhisperLiveKitConfig:
     confidence_validation: bool = False
     buffer_trimming_sec: float = 15.0
 
+    # Faster-whisper encoder compute type (auto, int8_float16, float16, int8, etc.)
+    fw_compute_type: str = "auto"
+
     # SimulStreaming-specific
     disable_fast_encoder: bool = False
     custom_alignment_heads: Optional[str] = None

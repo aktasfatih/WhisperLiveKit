@@ -21,3 +21,6 @@ class AlignAttConfig():
     init_prompt: str = field(default=None)
     static_init_prompt: str = field(default=None)
     max_context_tokens: int = field(default=None)
+    # Encoder cache: skip re-encoding when audio grew by fewer than this many
+    # seconds since the last full encode. 0 disables caching.
+    encoder_cache_threshold_s: float = 2.0

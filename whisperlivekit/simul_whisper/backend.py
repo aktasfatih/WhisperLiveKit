@@ -260,10 +260,12 @@ class SimulStreamingASR:
                 fw_model = str(self._resolved_model_path)
             else:
                 fw_model = self.model_name
+            fw_compute_type = getattr(self, 'fw_compute_type', 'auto')
+            logger.info(f'Faster Whisper compute_type={fw_compute_type}')
             self.fw_encoder = WhisperModel(
                 fw_model,
                 device='auto',
-                compute_type='auto',
+                compute_type=fw_compute_type,
             )
             self.shared_model = self.load_model()
         else:

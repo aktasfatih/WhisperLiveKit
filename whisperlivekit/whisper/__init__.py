@@ -593,7 +593,27 @@ def load_model(
             for layer, head in alignment_heads.tolist():
                 mask[layer, head] = True
             model.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
-    return model.to(device)
+            model._mark_alignment_cross_attn()
+
+    device_obj = torch.device(device)
+
+    model = model.to(device_obj)
+
+    # fp16 on CUDA for faster inference
+    if device_obj.type == "cuda":
+        model = model.half()
+
+    # torch.compile on encoder for kernel fusion (CUDA only, PyTorch 2.0+)
+    if device_obj.type == "cuda" and not decoder_only and hasattr(torch, "compile"):
+        try:
+            model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
+            import logging
+            logging.getLogger(__name__).info("Encoder compiled with torch.compile(reduce-overhead)")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"torch.compile failed, using eager mode: {e}")
+
+    return model
 
 
 def convert_encoder_to_coreml(

@@ -170,6 +170,8 @@ class AlignAtt(AlignAttBase):
             self.state.last_attend_frame -= int(TOKENS_PER_SECOND * removed_len)
             self.state.cumulative_time_offset += removed_len
             self.state.segments = self.state.segments[1:]
+            # Segments removed — encoder cache is stale
+            self.state.invalidate_encoder_cache()
             logger.debug(
                 f"remove segments: {len(self.state.segments)} {len(self.state.tokens)}, "
                 f"cumulative offset: {self.state.cumulative_time_offset:.2f}s"
@@ -237,6 +239,45 @@ class AlignAtt(AlignAttBase):
         return self.state.segments[0]
 
     def _encode(self, input_segments):
+        # Check encoder output cache: if audio hasn't grown enough since last
+        # full encode, reuse the cached encoder output. The decoder cross-attention
+        # sees slightly stale features for the newest ~2s of audio, but alignment
+        # heads handle this gracefully via the rewind mechanism.
+        current_audio_len = len(input_segments) / 16000.0
+        cache_threshold = self.cfg.encoder_cache_threshold_s
+        num_segments = len(self.state.segments)
+
+        if (
+            cache_threshold > 0
+            and self.state.encoder_cache_output is not None
+            and num_segments == self.state.encoder_cache_num_segments
+            and current_audio_len - self.state.encoder_cache_audio_len < cache_threshold
+        ):
+            logger.debug(
+                f"Encoder cache hit: {current_audio_len:.2f}s audio, "
+                f"cached at {self.state.encoder_cache_audio_len:.2f}s "
+                f"(threshold={cache_threshold}s)"
+            )
+            return self.state.encoder_cache_output, self.state.encoder_cache_mel_len
+
+        # Cache miss — run full encode
+        encoder_feature, content_mel_len = self._encode_full(input_segments)
+
+        # Update cache
+        if cache_threshold > 0:
+            self.state.encoder_cache_output = encoder_feature
+            self.state.encoder_cache_audio_len = current_audio_len
+            self.state.encoder_cache_mel_len = content_mel_len
+            self.state.encoder_cache_num_segments = num_segments
+            logger.debug(
+                f"Encoder cache updated: {current_audio_len:.2f}s audio, "
+                f"mel_len={content_mel_len}"
+            )
+
+        return encoder_feature, content_mel_len
+
+    def _encode_full(self, input_segments):
+        """Full encoder pass — called only on cache miss."""
         if self.use_mlcore:
             coreml_encoder, coreml_input_name, coreml_output_name = self.coreml_encoder_tuple
             mel_padded = log_mel_spectrogram(
@@ -350,6 +391,8 @@ class AlignAtt(AlignAttBase):
             flattened_attns = cross_attns
 
         for idx, attn_mat in enumerate(flattened_attns):
+            if attn_mat is None:
+                continue
             layer_rank = idx % num_decoder_layers
             align_heads_in_layer = self.state.align_source.get(layer_rank, [])
             if not align_heads_in_layer:

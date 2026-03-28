@@ -79,12 +79,13 @@ def disable_sdpa():
 
 
 class MultiHeadAttention(nn.Module):
-    use_sdpa = False  # Disable SDPA to ensure qk is always computed when needed
+    use_sdpa = True  # Enable SDPA globally — alignment layers override via force_raw_qk
 
     def __init__(self, n_state: int, n_head: int, cache_id: str = "", n_text_ctx: int = 448):
         super().__init__()
         self.n_head = n_head
         self.n_text_ctx = n_text_ctx
+        self.force_raw_qk = False  # Set True on alignment cross-attn layers
         self.query = Linear(n_state, n_state)
         self.key = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
@@ -154,7 +155,7 @@ class MultiHeadAttention(nn.Module):
         k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
 
-        if SDPA_AVAILABLE and MultiHeadAttention.use_sdpa:
+        if SDPA_AVAILABLE and MultiHeadAttention.use_sdpa and not self.force_raw_qk:
             a = scaled_dot_product_attention(
                 q, k, v, is_causal=mask is not None and n_ctx > 1
             )
@@ -359,6 +360,7 @@ class Whisper(nn.Module):
         )
         all_heads[self.dims.n_text_layer // 2 :] = True
         self.register_buffer("alignment_heads", all_heads.to_sparse(), persistent=False)
+        self._mark_alignment_cross_attn()
 
     def set_alignment_heads(self, dump: bytes):
         array = np.frombuffer(
@@ -368,6 +370,19 @@ class Whisper(nn.Module):
             self.dims.n_text_layer, self.dims.n_text_head
         )
         self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
+        self._mark_alignment_cross_attn()
+
+    def _mark_alignment_cross_attn(self):
+        """Mark cross-attention layers that have alignment heads so they return raw QK weights.
+        All other attention layers (encoder self-attn, decoder self-attn, non-alignment
+        cross-attn) use fast SDPA/Flash Attention."""
+        layers_with_alignment = set()
+        for layer_idx, _head_idx in self.alignment_heads.indices().T:
+            layers_with_alignment.add(layer_idx.item())
+        for layer_idx in range(len(self.decoder.blocks)):
+            cross_attn = self.decoder.blocks[layer_idx].cross_attn
+            if cross_attn is not None:
+                cross_attn.force_raw_qk = layer_idx in layers_with_alignment
 
     def embed_audio(self, mel: torch.Tensor):
         return self.encoder(mel)

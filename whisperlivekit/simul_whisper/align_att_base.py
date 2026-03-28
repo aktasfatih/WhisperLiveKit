@@ -120,6 +120,7 @@ class AlignAttBase(ABC):
         self.state.log_segments += 1
         self.state.pending_incomplete_tokens = []
         self.state.pending_retries = 0
+        self.state.invalidate_encoder_cache()
 
     def segments_len(self):
         return sum(s.shape[0] for s in self.state.segments) / 16000
