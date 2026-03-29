@@ -599,8 +599,10 @@ def load_model(
 
     model = model.to(device_obj)
 
-    # fp16 on CUDA for faster inference
-    if device_obj.type == "cuda":
+    # fp16 on CUDA for faster inference (skip when decoder_only —
+    # faster-whisper handles encoder precision, and the custom LayerNorm
+    # in the decoder has a float() cast that conflicts with half weights)
+    if device_obj.type == "cuda" and not decoder_only:
         model = model.half()
 
     # torch.compile on encoder for kernel fusion (CUDA only, PyTorch 2.0+)
