@@ -262,12 +262,20 @@ class SimulStreamingASR:
             else:
                 fw_model = self.model_name
             fw_compute_type = getattr(self, 'fw_compute_type', 'auto')
-            logger.info(f'Faster Whisper compute_type={fw_compute_type}')
+            # Flash attention requires Ampere+ (compute capability >= 8.0)
+            use_flash = False
+            if torch.cuda.is_available():
+                try:
+                    cc = torch.cuda.get_device_capability()
+                    use_flash = cc[0] >= 8
+                except Exception:
+                    pass
+            logger.info(f'Faster Whisper compute_type={fw_compute_type}, flash_attention={use_flash}')
             self.fw_encoder = WhisperModel(
                 fw_model,
                 device='auto',
                 compute_type=fw_compute_type,
-                flash_attention=True,
+                flash_attention=use_flash,
             )
             self.shared_model = self.load_model()
         else:
