@@ -1,5 +1,6 @@
 import gc
 import logging
+import os
 import platform
 import sys
 from typing import List, Tuple
@@ -10,6 +11,7 @@ import torch
 from whisperlivekit.backend_support import faster_backend_available, mlx_backend_available
 from whisperlivekit.model_paths import detect_model_format, resolve_model_path
 from whisperlivekit.simul_whisper.config import AlignAttConfig
+from whisperlivekit.simul_whisper.onnx_encoder import OnnxEncoder, ort_available
 from whisperlivekit.simul_whisper.simul_whisper import AlignAtt
 from whisperlivekit.timed_objects import ASRToken, ChangeSpeaker, Transcript
 from whisperlivekit.warmup import load_file
@@ -58,6 +60,7 @@ class SimulStreamingOnlineProcessor:
                 loaded_model=self.asr.shared_model,
                 mlx_encoder=self.asr.mlx_encoder,
                 fw_encoder=self.asr.fw_encoder,
+                onnx_encoder=getattr(self.asr, 'onnx_encoder', None),
             )
 
     def start_silence(self):
@@ -228,6 +231,7 @@ class SimulStreamingASR:
             self.tokenizer = None
 
         self.mlx_encoder, self.fw_encoder, self.mlx_model = None, None, None
+        self.onnx_encoder = None
         self.shared_model = None
 
         if self.use_full_mlx and HAS_MLX_WHISPER:
@@ -280,6 +284,18 @@ class SimulStreamingASR:
             self.shared_model = self.load_model()
         else:
             self.shared_model = self.load_model()
+            # Try ONNX Runtime encoder for TensorRT/CUDA acceleration
+            if ort_available() and getattr(self, 'use_onnx_encoder', True):
+                try:
+                    cache_dir = getattr(self, 'model_cache_dir', None) or '/models'
+                    onnx_cache = os.path.join(cache_dir, 'onnx')
+                    self.onnx_encoder = OnnxEncoder(model_cache_dir=onnx_cache)
+                    onnx_path = self.onnx_encoder.export_encoder(self.shared_model, self.model_name)
+                    self.onnx_encoder.load(onnx_path)
+                    logger.info("ONNX Runtime encoder initialized successfully")
+                except Exception as e:
+                    logger.warning(f"ONNX encoder setup failed, using PyTorch: {e}")
+                    self.onnx_encoder = None
 
     def _warmup_mlx_model(self):
         """Warmup the full MLX model."""

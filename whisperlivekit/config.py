@@ -67,6 +67,7 @@ class WhisperLiveKitConfig:
     static_init_prompt: Optional[str] = None
     max_context_tokens: Optional[int] = None
     encoder_cache_threshold_s: float = 2.0
+    use_onnx_encoder: bool = True
 
     # Diarization (diart)
     segmentation_model: str = "pyannote/segmentation-3.0"

@@ -16,6 +16,7 @@ from .beam import BeamPyTorchInference
 from .config import AlignAttConfig
 from .decoder_state import DecoderState
 from .eow_detection import fire_at_boundary, load_cif
+from .onnx_encoder import OnnxEncoder, ort_available
 from .token_buffer import TokenBuffer
 
 logger = logging.getLogger(__name__)
@@ -62,9 +63,11 @@ class AlignAtt(AlignAttBase):
         loaded_model=None,
         mlx_encoder=None,
         fw_encoder=None,
+        onnx_encoder=None,
     ) -> None:
         self.mlx_encoder = mlx_encoder
         self.fw_encoder = fw_encoder
+        self.onnx_encoder = onnx_encoder
         if fw_encoder:
             self.fw_feature_extractor = FeatureExtractor(
                 feature_size=loaded_model.dims.n_mels,
@@ -333,6 +336,18 @@ class AlignAtt(AlignAttBase):
                                 dtype=np.float32,
                             )
                 encoder_feature = torch.as_tensor(arr, device=self.device)
+        elif self.onnx_encoder is not None and self.onnx_encoder.is_loaded:
+            # ONNX Runtime encoder (TensorRT/CUDA accelerated)
+            audio_length_seconds = len(input_segments) / 16000
+            content_mel_len = int(audio_length_seconds * 100) // 2
+            mel_padded = log_mel_spectrogram(
+                input_segments, n_mels=self.model.dims.n_mels,
+                padding=N_SAMPLES, device='cpu',
+            ).unsqueeze(0)
+            mel = pad_or_trim(mel_padded, N_FRAMES)
+            mel_np = mel.numpy().astype(np.float32) if not mel.is_cuda else mel.cpu().numpy().astype(np.float32)
+            encoder_np = self.onnx_encoder.encode(mel_np)
+            encoder_feature = torch.as_tensor(encoder_np, device=self.device)
         else:
             current_len = len(input_segments)
             if (
