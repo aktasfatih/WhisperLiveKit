@@ -287,16 +287,23 @@ class SimulStreamingASR:
                 flash_attention=use_flash,
             )
             self.shared_model = self.load_model()
-            # Start batched encoder scheduler for concurrent sessions
-            self.batched_encoder = BatchedEncoderScheduler(
-                fw_encoder=self.fw_encoder,
-                feature_extractor=FeatureExtractor(feature_size=self.shared_model.dims.n_mels),
-                device='cuda' if torch.cuda.is_available() else 'cpu',
-                n_mels=self.shared_model.dims.n_mels,
-                batch_wait_ms=getattr(self, 'batch_wait_ms', 50.0),
-                max_batch_size=getattr(self, 'max_batch_size', 8),
-            )
-            self.batched_encoder.start()
+            # Start batched encoder scheduler only on GPUs with enough VRAM
+            # (batch_size=2 needs ~10GB; 6GB GPUs are too tight)
+            use_batched = False
+            if torch.cuda.is_available():
+                vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+                use_batched = vram_gb >= 10.0
+                logger.info(f"GPU VRAM: {vram_gb:.1f}GB, batched encoder: {use_batched}")
+            if use_batched:
+                self.batched_encoder = BatchedEncoderScheduler(
+                    fw_encoder=self.fw_encoder,
+                    feature_extractor=FeatureExtractor(feature_size=self.shared_model.dims.n_mels),
+                    device='cuda' if torch.cuda.is_available() else 'cpu',
+                    n_mels=self.shared_model.dims.n_mels,
+                    batch_wait_ms=getattr(self, 'batch_wait_ms', 50.0),
+                    max_batch_size=getattr(self, 'max_batch_size', 8),
+                )
+                self.batched_encoder.start()
         else:
             self.shared_model = self.load_model()
             # Try ONNX Runtime encoder for TensorRT/CUDA acceleration
