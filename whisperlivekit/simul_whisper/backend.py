@@ -291,7 +291,8 @@ class SimulStreamingASR:
             # (batch_size=2 needs ~10GB; 6GB GPUs are too tight)
             use_batched = False
             if torch.cuda.is_available():
-                vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+                props = torch.cuda.get_device_properties(0)
+                vram_gb = getattr(props, 'total_memory', getattr(props, 'total_mem', 0)) / (1024**3)
                 use_batched = vram_gb >= 10.0
                 logger.info(f"GPU VRAM: {vram_gb:.1f}GB, batched encoder: {use_batched}")
             if use_batched:
