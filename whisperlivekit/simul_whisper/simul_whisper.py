@@ -64,10 +64,12 @@ class AlignAtt(AlignAttBase):
         mlx_encoder=None,
         fw_encoder=None,
         onnx_encoder=None,
+        batched_encoder=None,
     ) -> None:
         self.mlx_encoder = mlx_encoder
         self.fw_encoder = fw_encoder
         self.onnx_encoder = onnx_encoder
+        self.batched_encoder = batched_encoder
         if fw_encoder:
             self.fw_feature_extractor = FeatureExtractor(
                 feature_size=loaded_model.dims.n_mels,
@@ -308,6 +310,9 @@ class AlignAtt(AlignAttBase):
             mlx_encoder_feature = self.mlx_encoder.encoder(mlx_mel[None])
             encoder_feature = torch.as_tensor(mlx_encoder_feature)
             content_mel_len = int((mlx_mel_padded.shape[0] - mlx_mel.shape[0]) / 2)
+        elif self.batched_encoder is not None and self.fw_encoder:
+            # Batched encoder: submit to scheduler for batching with other sessions
+            return self.batched_encoder.encode(input_segments)
         elif self.fw_encoder:
             audio_length_seconds = len(input_segments) / 16000
             content_mel_len = int(audio_length_seconds * 100) // 2

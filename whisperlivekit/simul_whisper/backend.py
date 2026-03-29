@@ -11,6 +11,7 @@ import torch
 from whisperlivekit.backend_support import faster_backend_available, mlx_backend_available
 from whisperlivekit.model_paths import detect_model_format, resolve_model_path
 from whisperlivekit.simul_whisper.config import AlignAttConfig
+from whisperlivekit.simul_whisper.batched_encoder import BatchedEncoderScheduler
 from whisperlivekit.simul_whisper.onnx_encoder import OnnxEncoder, ort_available
 from whisperlivekit.simul_whisper.simul_whisper import AlignAtt
 from whisperlivekit.timed_objects import ASRToken, ChangeSpeaker, Transcript
@@ -30,8 +31,10 @@ else:
 HAS_FASTER_WHISPER = faster_backend_available(warn_on_missing=not HAS_MLX_WHISPER)
 if HAS_FASTER_WHISPER:
     from faster_whisper import WhisperModel
+    from faster_whisper.feature_extractor import FeatureExtractor
 else:
     WhisperModel = None
+    FeatureExtractor = None
 
 MIN_DURATION_REAL_SILENCE = 5
 
@@ -61,6 +64,7 @@ class SimulStreamingOnlineProcessor:
                 mlx_encoder=self.asr.mlx_encoder,
                 fw_encoder=self.asr.fw_encoder,
                 onnx_encoder=getattr(self.asr, 'onnx_encoder', None),
+                batched_encoder=getattr(self.asr, 'batched_encoder', None),
             )
 
     def start_silence(self):
@@ -232,6 +236,7 @@ class SimulStreamingASR:
 
         self.mlx_encoder, self.fw_encoder, self.mlx_model = None, None, None
         self.onnx_encoder = None
+        self.batched_encoder = None
         self.shared_model = None
 
         if self.use_full_mlx and HAS_MLX_WHISPER:
@@ -282,6 +287,16 @@ class SimulStreamingASR:
                 flash_attention=use_flash,
             )
             self.shared_model = self.load_model()
+            # Start batched encoder scheduler for concurrent sessions
+            self.batched_encoder = BatchedEncoderScheduler(
+                fw_encoder=self.fw_encoder,
+                feature_extractor=FeatureExtractor(feature_size=self.shared_model.dims.n_mels),
+                device='cuda' if torch.cuda.is_available() else 'cpu',
+                n_mels=self.shared_model.dims.n_mels,
+                batch_wait_ms=getattr(self, 'batch_wait_ms', 50.0),
+                max_batch_size=getattr(self, 'max_batch_size', 8),
+            )
+            self.batched_encoder.start()
         else:
             self.shared_model = self.load_model()
             # Try ONNX Runtime encoder for TensorRT/CUDA acceleration

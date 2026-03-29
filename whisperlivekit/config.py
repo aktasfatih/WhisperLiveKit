@@ -68,6 +68,8 @@ class WhisperLiveKitConfig:
     max_context_tokens: Optional[int] = None
     encoder_cache_threshold_s: float = 2.0
     use_onnx_encoder: bool = True
+    batch_wait_ms: float = 50.0  # Max ms to wait for batching concurrent encoder requests
+    max_batch_size: int = 8  # Max sessions to batch in one encoder pass
 
     # Diarization (diart)
     segmentation_model: str = "pyannote/segmentation-3.0"
