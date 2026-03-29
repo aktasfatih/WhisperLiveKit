@@ -393,13 +393,14 @@ class AlignAtt(AlignAttBase):
                 kv_cache=self.state.kv_cache,
                 return_cross_attn=True,
             )
-            logits, cross_attns, hidden_state = result
+            logits, _cross_attns, hidden_state = result
             # Two-pass: extract alignment attention from hidden state
             # This is cheap — only computes Q·K^T for alignment heads
             align_attns = self.model.extract_alignment_attn(
                 hidden_state, encoder_feature, kv_cache=self.state.kv_cache
             )
-            return logits, align_attns
+            # Tag as two-pass so _process_cross_attention can detect the format
+            return logits, ("two_pass", align_attns)
         else:
             logger.debug(f"Logits shape: {tokens.shape}")
             return self.state.inference.logits(
@@ -429,26 +430,19 @@ class AlignAtt(AlignAttBase):
     def _process_cross_attention(
         self, cross_attns: List, content_mel_len: int,
     ) -> torch.Tensor:
-        """Process alignment attention weights from two-pass extraction.
-
-        The input cross_attns can be:
-        - From two-pass: list of tensors per layer, each (batch, num_align_heads, seq, audio_ctx)
-          where non-alignment layers are None
-        - From legacy single-pass: list of full QK tensors per token step
-        """
+        """Process alignment attention weights from two-pass or legacy extraction."""
         num_decoder_layers = len(self.model.decoder.blocks)
 
-        if cross_attns and isinstance(cross_attns[0], list):
+        # Detect two-pass tagged format: each entry is ("two_pass", [per-layer tensors])
+        is_two_pass = False
+        if cross_attns and isinstance(cross_attns[0], tuple) and cross_attns[0][0] == "two_pass":
+            # Unpack: take the latest two-pass result (last accumulated entry)
+            flattened_attns = cross_attns[-1][1]
+            is_two_pass = True
+        elif cross_attns and isinstance(cross_attns[0], list):
             flattened_attns = [attn for layer_list in cross_attns for attn in layer_list]
         else:
             flattened_attns = cross_attns
-
-        # Check if this is two-pass format (per-layer, alignment-heads-only tensors)
-        # Two-pass format: each entry is per-layer, only alignment heads present
-        is_two_pass = (
-            len(flattened_attns) == num_decoder_layers
-            and hasattr(self.model, '_alignment_layer_heads')
-        )
 
         if is_two_pass:
             # Two-pass: tensors already contain only alignment heads
