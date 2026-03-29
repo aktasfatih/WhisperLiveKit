@@ -443,31 +443,34 @@ class Whisper(nn.Module):
                 continue
 
             ca = block.cross_attn
-            # Q from current decoder state (after cross_attn_ln normalization)
-            q = ca.query(block.cross_attn_ln(x_after_self_attn))
+            head_dim = self.dims.n_text_state // ca.n_head
 
-            # K from cache (already computed during the SDPA forward pass)
-            if kv_cache is not None and ca.key_cache_id in kv_cache:
-                k = kv_cache[ca.key_cache_id]
-            else:
-                k = ca.key(xa)
+            try:
+                # Q from current decoder state
+                q = ca.query(block.cross_attn_ln(x_after_self_attn))
 
-            # Reshape to multi-head
-            n_batch, n_ctx, n_state = q.shape
-            scale = (n_state // ca.n_head) ** -0.25
-            q = q.view(n_batch, n_ctx, ca.n_head, -1).permute(0, 2, 1, 3)
-            k = k.view(n_batch, -1, ca.n_head, -1).permute(0, 2, 1, 3)
+                # K from cache (already computed during SDPA forward pass)
+                if kv_cache is not None and ca.key_cache_id in kv_cache:
+                    k = kv_cache[ca.key_cache_id]
+                else:
+                    k = ca.key(xa)
 
-            # Only compute QK for alignment heads (not all heads)
-            head_indices = self._alignment_layer_heads[layer_idx]
-            q_heads = q[:, head_indices, :, :]
-            k_heads = k[:, head_indices, :, :]
+                # Reshape to multi-head using explicit head_dim
+                n_batch = q.shape[0]
+                q = q.view(n_batch, -1, ca.n_head, head_dim).permute(0, 2, 1, 3)
+                k = k.view(n_batch, -1, ca.n_head, head_dim).permute(0, 2, 1, 3)
 
-            # QK^T — this is the only real computation
-            qk = (q_heads * scale) @ (k_heads * scale).transpose(-1, -2)
-            qk = qk.float().detach()
+                # Only compute QK for alignment heads
+                head_indices = self._alignment_layer_heads[layer_idx]
+                q_heads = q[:, head_indices, :, :]
+                k_heads = k[:, head_indices, :, :]
 
-            cross_attns.append(qk)
+                # QK^T — the only real computation
+                scale = head_dim ** -0.25
+                qk = (q_heads * scale) @ (k_heads * scale).transpose(-1, -2)
+                cross_attns.append(qk.float().detach())
+            except (RuntimeError, ValueError):
+                cross_attns.append(None)
 
         return cross_attns
 
