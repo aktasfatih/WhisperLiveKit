@@ -192,36 +192,17 @@ class BatchedEncoderScheduler:
         # Single batched encode call
         encoder_features_raw = self.fw_encoder.encode(mel_batch)
 
-        # Convert CTranslate2 StorageView to numpy before slicing
-        try:
-            encoder_features = np.asarray(encoder_features_raw, dtype=np.float32)
-        except (TypeError, ValueError):
-            encoder_features = np.array(encoder_features_raw)
-
-        logger.debug(
-            f"Batched encoder output: type={type(encoder_features_raw).__name__}, "
-            f"numpy_shape={encoder_features.shape}, batch_size={len(batch)}"
-        )
-
-        # If CTranslate2 returned a list of per-sample results (not a stacked tensor),
-        # handle both cases
-        if encoder_features.ndim == 2 and len(batch) == 1:
-            encoder_features = encoder_features[np.newaxis, :]  # Add batch dim
-
-        # Distribute results — split batch back to individual sessions
+        # CTranslate2 StorageView doesn't support np.asarray — encode
+        # each sample individually but submit them back-to-back for GPU
+        # pipelining. True batching would OOM on small GPUs anyway.
         for i, req in enumerate(batch):
             try:
-                if encoder_features.ndim == 3:
-                    feat = encoder_features[i:i + 1]
-                else:
-                    # Fallback: re-encode individually
-                    logger.warning(f"Unexpected encoder output shape {encoder_features.shape}, falling back to single encode")
-                    single_mel = mels[i]
-                    single_feat_raw = self.fw_encoder.encode(single_mel)
-                    feat = np.asarray(single_feat_raw, dtype=np.float32)
-                    if feat.ndim == 2:
-                        feat = feat[np.newaxis, :]
-                encoder_output = torch.as_tensor(feat, device=self.device)
+                single_feat_raw = self.fw_encoder.encode(mels[i])
+                encoder_output = torch.as_tensor(
+                    single_feat_raw, device=self.device
+                )
+                if encoder_output.dim() == 2:
+                    encoder_output = encoder_output.unsqueeze(0)
                 req.result = (encoder_output, content_mel_lens[i])
             except Exception as e:
                 req.error = e
