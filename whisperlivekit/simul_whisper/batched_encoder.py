@@ -190,24 +190,22 @@ class BatchedEncoderScheduler:
         mel_batch = np.concatenate(mels, axis=0)  # (batch, n_mels, N_FRAMES)
 
         # Single batched encode call
-        encoder_features = self.fw_encoder.encode(mel_batch)
+        encoder_features_raw = self.fw_encoder.encode(mel_batch)
 
-        # Distribute results
+        # Convert CTranslate2 StorageView to numpy before slicing
+        try:
+            encoder_features = np.asarray(encoder_features_raw, dtype=np.float32)
+        except (TypeError, ValueError):
+            encoder_features = np.array(encoder_features_raw)
+
+        # Distribute results — split batch back to individual sessions
         for i, req in enumerate(batch):
             try:
-                if self.device == 'cpu':
-                    feat = np.array(encoder_features[i:i + 1])
-                else:
-                    feat = encoder_features[i:i + 1]
+                feat = encoder_features[i:i + 1]
                 encoder_output = torch.as_tensor(feat, device=self.device)
                 req.result = (encoder_output, content_mel_lens[i])
-            except (TypeError, ValueError) as e:
-                try:
-                    arr = np.asarray(encoder_features[i:i + 1], dtype=np.float32)
-                    encoder_output = torch.as_tensor(arr, device=self.device)
-                    req.result = (encoder_output, content_mel_lens[i])
-                except Exception:
-                    req.error = e
+            except Exception as e:
+                req.error = e
             req.event.set()
 
     def _process_batch_pytorch(self, batch, N_FRAMES, N_SAMPLES, log_mel_spectrogram, pad_or_trim):
