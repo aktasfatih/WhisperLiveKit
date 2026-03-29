@@ -267,6 +267,7 @@ class SimulStreamingASR:
                 fw_model,
                 device='auto',
                 compute_type=fw_compute_type,
+                flash_attention=True,
             )
             self.shared_model = self.load_model()
         else:

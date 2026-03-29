@@ -131,20 +131,51 @@ class MultiHeadAttention(nn.Module):
     def _update_self_attn_cache(
         self, k: Tensor, v: Tensor, kv_cache: dict
     ) -> Tuple[Tensor, Tensor]:
-        """Update self-attention kv cache by concatenating new k,v with cached values."""
-        if self.key_cache_id not in kv_cache or k.shape[1] > self.n_text_ctx:
-            # First token or context overflow: save as-is
+        """Update self-attention kv cache using pre-allocated static buffers.
+
+        Instead of torch.cat (which allocates new memory each step),
+        we pre-allocate a buffer on first use and write into it with
+        index assignment. Falls back to cat for overflow.
+        """
+        buf_key = f"{self.key_cache_id}_buf"
+        pos_key = f"{self.key_cache_id}_pos"
+
+        if buf_key not in kv_cache:
+            # First token: allocate static buffer for max sequence length
+            batch_size, seq_len, state_dim = k.shape
+            max_len = self.n_text_ctx
+            k_buf = torch.zeros(batch_size, max_len, state_dim, dtype=k.dtype, device=k.device)
+            v_buf = torch.zeros(batch_size, max_len, state_dim, dtype=v.dtype, device=v.device)
+            k_buf[:, :seq_len] = k
+            v_buf[:, :seq_len] = v
+            kv_cache[buf_key] = (k_buf, v_buf)
+            kv_cache[pos_key] = seq_len
+            kv_cache[self.key_cache_id] = k_buf[:, :seq_len]
+            kv_cache[self.value_cache_id] = v_buf[:, :seq_len]
+        else:
+            k_buf, v_buf = kv_cache[buf_key]
+            pos = kv_cache[pos_key]
+            new_len = k.shape[1]
+            end_pos = pos + new_len
+
+            if end_pos <= k_buf.shape[1]:
+                # Write into pre-allocated buffer (no allocation)
+                k_buf[:, pos:end_pos] = k
+                v_buf[:, pos:end_pos] = v
+                kv_cache[pos_key] = end_pos
+                k = k_buf[:, :end_pos]
+                v = v_buf[:, :end_pos]
+            else:
+                # Overflow: fall back to cat (rare, only at max context)
+                cached_k = kv_cache[self.key_cache_id]
+                cached_v = kv_cache[self.value_cache_id]
+                k = torch.cat([cached_k, k], dim=1)
+                v = torch.cat([cached_v, v], dim=1)
+
             kv_cache[self.key_cache_id] = k.detach()
             kv_cache[self.value_cache_id] = v.detach()
-        else:
-            # Concatenate with existing cache
-            cached_k = kv_cache[self.key_cache_id]
-            cached_v = kv_cache[self.value_cache_id]
-            k = torch.cat([cached_k, k], dim=1).detach()
-            v = torch.cat([cached_v, v], dim=1).detach()
-            kv_cache[self.key_cache_id] = k
-            kv_cache[self.value_cache_id] = v
-        return k, v
+
+        return kv_cache[self.key_cache_id], kv_cache[self.value_cache_id]
 
     def qkv_attention(
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
@@ -329,7 +360,7 @@ class TextDecoder(nn.Module):
         ).float()
 
         if return_cross_attn:
-            return logits, cross_attns
+            return logits, cross_attns, x
         return logits
 
 
@@ -373,16 +404,72 @@ class Whisper(nn.Module):
         self._mark_alignment_cross_attn()
 
     def _mark_alignment_cross_attn(self):
-        """Mark cross-attention layers that have alignment heads so they return raw QK weights.
-        All other attention layers (encoder self-attn, decoder self-attn, non-alignment
-        cross-attn) use fast SDPA/Flash Attention."""
-        layers_with_alignment = set()
-        for layer_idx, _head_idx in self.alignment_heads.indices().T:
-            layers_with_alignment.add(layer_idx.item())
-        for layer_idx in range(len(self.decoder.blocks)):
-            cross_attn = self.decoder.blocks[layer_idx].cross_attn
-            if cross_attn is not None:
-                cross_attn.force_raw_qk = layer_idx in layers_with_alignment
+        """Identify alignment head layers for two-pass extraction.
+        All layers use fast SDPA. Alignment weights are extracted in a cheap
+        second pass using only Q and cached K from the specific heads needed."""
+        self._alignment_layer_heads = {}
+        for layer_idx, head_idx in self.alignment_heads.indices().T:
+            layer_idx = layer_idx.item()
+            head_idx = head_idx.item()
+            self._alignment_layer_heads.setdefault(layer_idx, []).append(head_idx)
+        # All cross-attention layers use SDPA — no force_raw_qk
+        for block in self.decoder.blocks:
+            if block.cross_attn is not None:
+                block.cross_attn.force_raw_qk = False
+
+    def extract_alignment_attn(
+        self, x_after_self_attn: Tensor, xa: Tensor, kv_cache: Optional[dict] = None
+    ) -> list:
+        """Cheap second pass: extract cross-attention QK weights for alignment heads only.
+
+        Instead of re-running the full decoder, we only compute Q·K^T for the specific
+        cross-attention heads used for alignment. This avoids the V multiplication and
+        MLP computation entirely.
+
+        Args:
+            x_after_self_attn: Decoder hidden states after the last self-attention + cross-attn + MLP
+                               (shape: batch, seq_len, n_state). We use these to compute Q.
+            xa: Encoder features (shape: batch, audio_ctx, n_state)
+            kv_cache: KV cache dict (cross-attention K is already cached here from the main pass)
+
+        Returns:
+            List of QK attention weight tensors, one per decoder layer.
+            Non-alignment layers return None.
+        """
+        cross_attns = []
+        for layer_idx, block in enumerate(self.decoder.blocks):
+            if layer_idx not in self._alignment_layer_heads or block.cross_attn is None:
+                cross_attns.append(None)
+                continue
+
+            ca = block.cross_attn
+            # Q from current decoder state (after cross_attn_ln normalization)
+            q = ca.query(block.cross_attn_ln(x_after_self_attn))
+
+            # K from cache (already computed during the SDPA forward pass)
+            if kv_cache is not None and ca.key_cache_id in kv_cache:
+                k = kv_cache[ca.key_cache_id]
+            else:
+                k = ca.key(xa)
+
+            # Reshape to multi-head
+            n_batch, n_ctx, n_state = q.shape
+            scale = (n_state // ca.n_head) ** -0.25
+            q = q.view(n_batch, n_ctx, ca.n_head, -1).permute(0, 2, 1, 3)
+            k = k.view(n_batch, -1, ca.n_head, -1).permute(0, 2, 1, 3)
+
+            # Only compute QK for alignment heads (not all heads)
+            head_indices = self._alignment_layer_heads[layer_idx]
+            q_heads = q[:, head_indices, :, :]
+            k_heads = k[:, head_indices, :, :]
+
+            # QK^T — this is the only real computation
+            qk = (q_heads * scale) @ (k_heads * scale).transpose(-1, -2)
+            qk = qk.float().detach()
+
+            cross_attns.append(qk)
+
+        return cross_attns
 
     def embed_audio(self, mel: torch.Tensor):
         return self.encoder(mel)

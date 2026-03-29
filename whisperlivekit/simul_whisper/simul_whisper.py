@@ -373,11 +373,18 @@ class AlignAtt(AlignAttBase):
 
     def _get_logits_and_cross_attn(self, tokens, encoder_feature):
         if self.state.decoder_type == "greedy":
-            return self.model.decoder(
+            result = self.model.decoder(
                 tokens, encoder_feature,
                 kv_cache=self.state.kv_cache,
                 return_cross_attn=True,
             )
+            logits, cross_attns, hidden_state = result
+            # Two-pass: extract alignment attention from hidden state
+            # This is cheap — only computes Q·K^T for alignment heads
+            align_attns = self.model.extract_alignment_attn(
+                hidden_state, encoder_feature, kv_cache=self.state.kv_cache
+            )
+            return logits, align_attns
         else:
             logger.debug(f"Logits shape: {tokens.shape}")
             return self.state.inference.logits(
@@ -407,7 +414,13 @@ class AlignAtt(AlignAttBase):
     def _process_cross_attention(
         self, cross_attns: List, content_mel_len: int,
     ) -> torch.Tensor:
-        attn_of_alignment_heads = [[] for _ in range(self.state.num_align_heads)]
+        """Process alignment attention weights from two-pass extraction.
+
+        The input cross_attns can be:
+        - From two-pass: list of tensors per layer, each (batch, num_align_heads, seq, audio_ctx)
+          where non-alignment layers are None
+        - From legacy single-pass: list of full QK tensors per token step
+        """
         num_decoder_layers = len(self.model.decoder.blocks)
 
         if cross_attns and isinstance(cross_attns[0], list):
@@ -415,41 +428,71 @@ class AlignAtt(AlignAttBase):
         else:
             flattened_attns = cross_attns
 
-        for idx, attn_mat in enumerate(flattened_attns):
-            if attn_mat is None:
-                continue
-            layer_rank = idx % num_decoder_layers
-            align_heads_in_layer = self.state.align_source.get(layer_rank, [])
-            if not align_heads_in_layer:
-                continue
-            attn_mat = F.softmax(attn_mat, dim=-1)
-            for align_head_rank, head_id in align_heads_in_layer:
-                if self.cfg.beam_size == 1:
-                    if attn_mat.dim() == 4:
-                        a = attn_mat[0, head_id, :, :]
-                    else:
-                        a = attn_mat[head_id, :, :]
-                    a = a.unsqueeze(0)
-                else:
-                    a = attn_mat[:, head_id, :, :]
-                attn_of_alignment_heads[align_head_rank].append(a)
-
-        tmp = []
-        for mat in attn_of_alignment_heads:
-            if mat:
-                tmp.append(torch.cat(mat, dim=1))
-        if not tmp:
-            return torch.zeros(self.cfg.beam_size, 1, content_mel_len, device=self.device)
-
-        attn_of_alignment_heads = torch.stack(tmp, dim=1)
-        std, mean = torch.std_mean(
-            attn_of_alignment_heads, dim=-2, keepdim=True, unbiased=False,
+        # Check if this is two-pass format (per-layer, alignment-heads-only tensors)
+        # Two-pass format: each entry is per-layer, only alignment heads present
+        is_two_pass = (
+            len(flattened_attns) == num_decoder_layers
+            and hasattr(self.model, '_alignment_layer_heads')
         )
-        attn_of_alignment_heads = (attn_of_alignment_heads - mean) / (std + 1e-8)
-        attn_of_alignment_heads = median_filter(attn_of_alignment_heads, 7)
-        attn_of_alignment_heads = attn_of_alignment_heads.mean(dim=1)
-        attn_of_alignment_heads = attn_of_alignment_heads[:, :, :content_mel_len]
-        return attn_of_alignment_heads
+
+        if is_two_pass:
+            # Two-pass: tensors already contain only alignment heads
+            all_head_attns = []
+            for layer_idx, attn_mat in enumerate(flattened_attns):
+                if attn_mat is None:
+                    continue
+                attn_mat = F.softmax(attn_mat, dim=-1)
+                # Each head in the tensor IS an alignment head
+                for local_idx in range(attn_mat.shape[1]):
+                    if self.cfg.beam_size == 1:
+                        a = attn_mat[0, local_idx, :, :].unsqueeze(0)
+                    else:
+                        a = attn_mat[:, local_idx, :, :]
+                    all_head_attns.append(a)
+
+            if not all_head_attns:
+                return torch.zeros(self.cfg.beam_size, 1, content_mel_len, device=self.device)
+
+            # Stack: (num_align_heads, batch, seq, audio_ctx)
+            attn_stack = torch.stack(all_head_attns, dim=1)
+        else:
+            # Legacy single-pass format
+            attn_of_alignment_heads = [[] for _ in range(self.state.num_align_heads)]
+            for idx, attn_mat in enumerate(flattened_attns):
+                if attn_mat is None:
+                    continue
+                layer_rank = idx % num_decoder_layers
+                align_heads_in_layer = self.state.align_source.get(layer_rank, [])
+                if not align_heads_in_layer:
+                    continue
+                attn_mat = F.softmax(attn_mat, dim=-1)
+                for align_head_rank, head_id in align_heads_in_layer:
+                    if self.cfg.beam_size == 1:
+                        if attn_mat.dim() == 4:
+                            a = attn_mat[0, head_id, :, :]
+                        else:
+                            a = attn_mat[head_id, :, :]
+                        a = a.unsqueeze(0)
+                    else:
+                        a = attn_mat[:, head_id, :, :]
+                    attn_of_alignment_heads[align_head_rank].append(a)
+
+            tmp = []
+            for mat in attn_of_alignment_heads:
+                if mat:
+                    tmp.append(torch.cat(mat, dim=1))
+            if not tmp:
+                return torch.zeros(self.cfg.beam_size, 1, content_mel_len, device=self.device)
+            attn_stack = torch.stack(tmp, dim=1)
+
+        std, mean = torch.std_mean(
+            attn_stack, dim=-2, keepdim=True, unbiased=False,
+        )
+        attn_stack = (attn_stack - mean) / (std + 1e-8)
+        attn_stack = median_filter(attn_stack, 7)
+        attn_stack = attn_stack.mean(dim=1)
+        attn_stack = attn_stack[:, :, :content_mel_len]
+        return attn_stack
 
     def _get_attended_frames(self, attn):
         most_attended_frames = torch.argmax(attn[:, -1, :], dim=-1)
