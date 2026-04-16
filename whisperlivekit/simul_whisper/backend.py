@@ -285,6 +285,7 @@ class SimulStreamingASR:
                 device='auto',
                 compute_type=fw_compute_type,
                 flash_attention=use_flash,
+                num_workers=2,
             )
             self.shared_model = self.load_model()
             # Start batched encoder scheduler only on GPUs with enough VRAM

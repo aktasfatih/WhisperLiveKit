@@ -171,42 +171,16 @@ class BatchedEncoderScheduler:
                     req.event.set()
 
     def _process_batch_fw(self, batch, N_FRAMES, N_SAMPLES, fw_pad_or_trim):
-        """Process a batch using faster-whisper encoder."""
-        mels = []
-        content_mel_lens = []
+        """Process a batch using faster-whisper encoder.
 
+        CTranslate2's StorageView cannot be sliced back into per-sample
+        results, so we encode each sample individually.  The scheduler's
+        50ms collection window still provides fair round-robin scheduling
+        across sessions and back-to-back GPU submission benefits from
+        CTranslate2's internal worker queue (num_workers >= 2).
+        """
         for req in batch:
-            audio_length_seconds = len(req.audio) / 16000
-            content_mel_len = int(audio_length_seconds * 100) // 2
-            content_mel_lens.append(content_mel_len)
-
-            mel_padded = self.feature_extractor(
-                waveform=req.audio.numpy(), padding=N_SAMPLES,
-            )[None, :]
-            mel = fw_pad_or_trim(mel_padded, N_FRAMES, axis=-1)
-            mels.append(mel)
-
-        # Stack into batch
-        mel_batch = np.concatenate(mels, axis=0)  # (batch, n_mels, N_FRAMES)
-
-        # Single batched encode call
-        encoder_features_raw = self.fw_encoder.encode(mel_batch)
-
-        # CTranslate2 StorageView doesn't support np.asarray — encode
-        # each sample individually but submit them back-to-back for GPU
-        # pipelining. True batching would OOM on small GPUs anyway.
-        for i, req in enumerate(batch):
-            try:
-                single_feat_raw = self.fw_encoder.encode(mels[i])
-                encoder_output = torch.as_tensor(
-                    single_feat_raw, device=self.device
-                )
-                if encoder_output.dim() == 2:
-                    encoder_output = encoder_output.unsqueeze(0)
-                req.result = (encoder_output, content_mel_lens[i])
-            except Exception as e:
-                req.error = e
-            req.event.set()
+            self._process_single_fw(req, N_FRAMES, N_SAMPLES, fw_pad_or_trim)
 
     def _process_batch_pytorch(self, batch, N_FRAMES, N_SAMPLES, log_mel_spectrogram, pad_or_trim):
         """Process a batch using PyTorch encoder."""
